@@ -1,126 +1,251 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import { CustomerHistory } from "./components/CustomerHistory";
+import { NewOrderForm, OrderDraft } from "./components/NewOrderForm";
+import { OrderDetail } from "./components/OrderDetail";
+import {
+  BOARD_TYPES,
+  BoardType,
+  damageComplete,
+  edgeComplete,
+  OrderStatus,
+  seedOrders,
+  WorkOrder,
+} from "./types";
 
-const project = {
-  "sourceNo": 6,
-  "id": "hxyfront-62004",
-  "port": 62004,
-  "title": "滑雪板调校维护",
-  "domain": "滑雪装备调校",
-  "prompt": "我想做一个面向滑雪板调校店的装备维护前端系统，技师可以记录雪板品牌、长度、板型、刃角、打蜡类型、底板损伤、修补位置和客户偏好。页面需要有维护工单列表、刃角参数表、底板损伤标记区、完工状态筛选和客户历史维护记录。",
-  "palette": [
-    "#0369a1",
-    "#14b8a6",
-    "#f97316"
-  ],
-  "metrics": [
-    "待维护",
-    "完工工单",
-    "平均刃角",
-    "底板修补"
-  ],
-  "filters": [
-    "全地域",
-    "公园板",
-    "竞速板",
-    "粉雪板"
-  ],
-  "fields": [
-    "雪板品牌",
-    "长度",
-    "板型",
-    "刃角",
-    "打蜡类型",
-    "底板损伤"
-  ],
-  "records": [
-    [
-      "ORD-106",
-      "Burton 156",
-      "侧刃88°，底刃1°",
-      "已打低温蜡"
-    ],
-    [
-      "ORD-112",
-      "竞速板165",
-      "底板划痕12cm",
-      "待补P-Tex"
-    ],
-    [
-      "ORD-118",
-      "粉雪板158",
-      "客户偏好弱咬雪",
-      "待交付"
-    ]
-  ]
-};
+const STORAGE_KEY = "ski-tune-workbench-v1";
+
+interface Persisted {
+  orders: WorkOrder[];
+  selectedId: string | null;
+}
+
+function load(): Persisted {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Persisted;
+      if (Array.isArray(parsed.orders)) return parsed;
+    }
+  } catch {
+    /* 本地数据损坏时回退到种子数据 */
+  }
+  return { orders: seedOrders(), selectedId: null };
+}
+
+/** 状态筛选：「完工」筛选只显示已交付记录 */
+const STATUS_FILTERS: { label: string; match: (s: OrderStatus) => boolean }[] = [
+  { label: "全部", match: () => true },
+  { label: "待维护", match: (s) => s === "待维护" },
+  { label: "维护中", match: (s) => s === "维护中" },
+  { label: "已完工", match: (s) => s === "已完工" },
+  { label: "完工", match: (s) => s === "已交付" },
+];
 
 function App() {
+  const [persisted] = useState(load);
+  const [orders, setOrders] = useState<WorkOrder[]>(persisted.orders);
+  const [selectedId, setSelectedId] = useState<string | null>(persisted.selectedId);
+  const [creating, setCreating] = useState(false);
+  const [statusFilter, setStatusFilter] = useState("全部");
+  const [typeFilter, setTypeFilter] = useState<BoardType | "全部">("全部");
+  const [historyCustomer, setHistoryCustomer] = useState<string | null>(null);
+
+  // 工单与选中状态落盘：关闭再打开仍保留，状态留痕一并保存
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ orders, selectedId }));
+  }, [orders, selectedId]);
+
+  const selected = orders.find((o) => o.id === selectedId) ?? null;
+
+  const queue = useMemo(() => {
+    const sf = STATUS_FILTERS.find((f) => f.label === statusFilter) ?? STATUS_FILTERS[0];
+    return orders
+      .filter((o) => sf.match(o.status))
+      .filter((o) => typeFilter === "全部" || o.boardType === typeFilter)
+      .sort((a, b) => a.seq - b.seq); // 按交板顺序排列
+  }, [orders, statusFilter, typeFilter]);
+
+  const metrics = useMemo(() => {
+    const backlog = orders.filter((o) => o.status === "待维护" || o.status === "维护中").length;
+    const done = orders.filter((o) => o.status === "已完工" || o.status === "已交付").length;
+    const edged = orders.filter((o) => edgeComplete(o.edge));
+    const avgEdge =
+      edged.length > 0
+        ? (edged.reduce((sum, o) => sum + Number(o.edge.sideEdge), 0) / edged.length).toFixed(1) + "°"
+        : "—";
+    const repairs = orders.reduce((sum, o) => sum + o.damages.length, 0);
+    return [
+      { label: "待维护", value: String(backlog) },
+      { label: "完工工单", value: String(done) },
+      { label: "平均刃角", value: avgEdge },
+      { label: "底板修补", value: String(repairs) },
+    ];
+  }, [orders]);
+
+  const updateOrder = (next: WorkOrder) =>
+    setOrders((prev) => prev.map((o) => (o.id === next.id ? next : o)));
+
+  const changeStatus = (id: string, to: OrderStatus) =>
+    setOrders((prev) =>
+      prev.map((o) =>
+        o.id === id
+          ? { ...o, status: to, history: [...o.history, { at: Date.now(), from: o.status, to }] }
+          : o
+      )
+    );
+
+  const createOrder = (draft: OrderDraft) => {
+    const maxNum = orders.reduce((m, o) => Math.max(m, Number(o.id.replace("ORD-", "")) || 0), 100);
+    const maxSeq = orders.reduce((m, o) => Math.max(m, o.seq), 0);
+    const now = Date.now();
+    const order: WorkOrder = {
+      ...draft,
+      id: `ORD-${maxNum + 1}`,
+      seq: maxSeq + 1,
+      status: "待维护",
+      createdAt: now,
+      history: [{ at: now, from: "创建", to: "待维护" }],
+    };
+    // 新增后左侧队列与客户历史立即反映
+    setOrders((prev) => [...prev, order]);
+    setSelectedId(order.id);
+    setCreating(false);
+  };
+
   return (
     <main className="app">
       <section className="hero">
-        <p>{project.id} · 源提示词{project.sourceNo} · Port {project.port}</p>
-        <h1>{project.title}</h1>
-        <span>{project.prompt}</span>
+        <p>滑雪板调校店 · 技师工作台</p>
+        <h1>滑雪板调校维护</h1>
+        <span>
+          左侧按交板顺序排列工单，缺刃角检查或损伤标记的工单会标红提醒；完工前必须两项齐全，完工筛选只显示已交付记录。
+        </span>
       </section>
 
       <section className="metrics">
-        {project.metrics.map((metric: string, index: number) => (
-          <article key={metric}>
-            <small>{metric}</small>
-            <strong>{[86, 14, 7, 32][index] ?? 12}</strong>
+        {metrics.map((m) => (
+          <article key={m.label}>
+            <small>{m.label}</small>
+            <strong>{m.value}</strong>
           </article>
         ))}
       </section>
 
-      <section className="workspace">
-        <aside className="panel">
-          <h2>{project.domain}筛选</h2>
+      <div className="layout">
+        <aside className="panel queue-panel">
+          <div className="heading">
+            <div>
+              <p>交板队列</p>
+              <h2>维护工单</h2>
+            </div>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => {
+                setCreating(true);
+                setSelectedId(null);
+              }}
+            >
+              ＋ 登记
+            </button>
+          </div>
+
           <div className="chips">
-            {project.filters.map((item: string) => (
-              <button key={item}>{item}</button>
+            {STATUS_FILTERS.map((f) => (
+              <button
+                key={f.label}
+                type="button"
+                className={statusFilter === f.label ? "chip active" : "chip"}
+                onClick={() => setStatusFilter(f.label)}
+              >
+                {f.label}
+                <em className="chip-count">{orders.filter((o) => f.match(o.status)).length}</em>
+              </button>
             ))}
+          </div>
+          <div className="chips">
+            {(["全部", ...BOARD_TYPES] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                className={typeFilter === t ? "chip active" : "chip"}
+                onClick={() => setTypeFilter(t)}
+              >
+                {t === "全部" ? "全部板型" : t}
+              </button>
+            ))}
+          </div>
+
+          <div className="queue">
+            {queue.length === 0 && <p className="queue-empty">当前筛选下没有工单。</p>}
+            {queue.map((o) => {
+              const missEdge = !edgeComplete(o.edge);
+              const missDamage = !damageComplete(o);
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  className={o.id === selectedId ? "queue-item selected" : "queue-item"}
+                  onClick={() => {
+                    setSelectedId(o.id);
+                    setCreating(false);
+                  }}
+                >
+                  <span className="q-seq">#{String(o.seq).padStart(2, "0")}</span>
+                  <span className="q-main">
+                    <span className="q-line1">
+                      <b>{o.id}</b>
+                      <span className={`status-badge s-${o.status}`}>{o.status}</span>
+                    </span>
+                    <span className="q-line2">
+                      {o.customer} · {o.brand} {o.length}cm · {o.boardType || "未登记板型"}
+                    </span>
+                    {(missEdge || missDamage) && o.status !== "已交付" && (
+                      <span className="q-flags">
+                        {missEdge && <em className="flag">缺刃角</em>}
+                        {missDamage && <em className="flag">缺损伤标记</em>}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </aside>
 
-        <section className="panel form-panel">
-          <div className="heading">
-            <div>
-              <p>专业字段</p>
-              <h2>新增记录</h2>
-            </div>
-            <button className="primary">保存草稿</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
+        {creating ? (
+          <NewOrderForm
+            onSubmit={createOrder}
+            onCancel={() => setCreating(false)}
+          />
+        ) : selected ? (
+          <OrderDetail
+            order={selected}
+            onUpdate={updateOrder}
+            onChangeStatus={changeStatus}
+            onOpenHistory={setHistoryCustomer}
+          />
+        ) : (
+          <section className="panel detail-panel placeholder">
+            <h2>从左侧队列选择一张工单</h2>
+            <p>或点击「＋ 登记」为前台新交的雪板建单。</p>
+          </section>
+        )}
+      </div>
 
-      <section className="panel">
-        <div className="heading">
-          <div>
-            <p>历史记录</p>
-            <h2>近期工作台</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="records">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")}>
-              <b>{String(index + 1).padStart(2, "0")}</b>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      {historyCustomer && (
+        <CustomerHistory
+          customer={historyCustomer}
+          orders={orders}
+          onClose={() => setHistoryCustomer(null)}
+          onSelect={(id) => {
+            setSelectedId(id);
+            setCreating(false);
+            setHistoryCustomer(null);
+          }}
+        />
+      )}
     </main>
   );
 }
